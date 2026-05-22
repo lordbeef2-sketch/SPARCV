@@ -179,6 +179,11 @@ function Get-DistributionRootFromPath {
         throw "Expanded distribution root '$resolvedPath' does not contain release/vxworks-6.9-*.tar.gz."
     }
 
+    $releaseDirectory = Split-Path -Parent $releaseTarball.FullName
+    if ((Split-Path -Leaf $releaseDirectory) -ieq 'release') {
+        return (Split-Path -Parent $releaseDirectory)
+    }
+
     return $resolvedPath
 }
 
@@ -613,6 +618,7 @@ try {
     if ($ExpandedDistributionRoot) {
         Write-Step 'Using a pre-expanded LEON distribution'
         $distExpandedRoot = Get-DistributionRootFromPath -Path $ExpandedDistributionRoot
+        Write-Host "Distribution root: $distExpandedRoot"
     }
     else {
 
@@ -635,6 +641,8 @@ try {
             -TarExe $tarExe `
             -ArchivePath $distributionTarball `
             -DestinationPath $distExpandedRoot
+        $distExpandedRoot = Get-DistributionRootFromPath -Path $distExpandedRoot
+        Write-Host "Distribution root: $distExpandedRoot"
     }
 
     if (-not $SkipToolchainInstall) {

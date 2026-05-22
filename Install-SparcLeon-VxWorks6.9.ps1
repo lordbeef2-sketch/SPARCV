@@ -162,6 +162,19 @@ function Find-ArtifactPath {
     return $null
 }
 
+function Get-ReleaseArchive {
+    param([string]$RootPath)
+
+    foreach ($filter in @('vxworks-6.9-*-src.tar', 'vxworks-6.9-*.tar.gz', 'vxworks-6.9-*.tar')) {
+        $match = Get-ChildItem -Path $RootPath -Recurse -File -Filter $filter -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($match) {
+            return $match
+        }
+    }
+
+    return $null
+}
+
 function Get-DistributionRootFromPath {
     param([string]$Path)
 
@@ -174,9 +187,9 @@ function Get-DistributionRootFromPath {
     }
 
     $resolvedPath = (Resolve-Path -LiteralPath $Path).Path
-    $releaseTarball = Get-ChildItem -Path $resolvedPath -Recurse -File -Filter 'vxworks-6.9-*.tar.gz' | Select-Object -First 1
+    $releaseTarball = Get-ReleaseArchive -RootPath $resolvedPath
     if (-not $releaseTarball) {
-        throw "Expanded distribution root '$resolvedPath' does not contain release/vxworks-6.9-*.tar.gz."
+        throw "Expanded distribution root '$resolvedPath' does not contain a release archive such as vxworks-6.9-*-src.tar."
     }
 
     $releaseDirectory = Split-Path -Parent $releaseTarball.FullName
@@ -185,6 +198,34 @@ function Get-DistributionRootFromPath {
     }
 
     return $resolvedPath
+}
+
+function Find-ExpandedDistributionPath {
+    param([string[]]$SearchRoots)
+
+    foreach ($root in $SearchRoots) {
+        if ([string]::IsNullOrWhiteSpace($root) -or -not (Test-Path -LiteralPath $root)) {
+            continue
+        }
+
+        try {
+            return Get-DistributionRootFromPath -Path $root
+        }
+        catch {
+        }
+
+        $releaseMatch = Get-ReleaseArchive -RootPath $root
+        if ($releaseMatch) {
+            $releaseDirectory = Split-Path -Parent $releaseMatch.FullName
+            if ((Split-Path -Leaf $releaseDirectory) -ieq 'release') {
+                return (Split-Path -Parent $releaseDirectory)
+            }
+
+            return (Split-Path -Parent $releaseMatch.FullName)
+        }
+    }
+
+    return $null
 }
 
 function Resolve-DownloadCredential {
@@ -457,14 +498,17 @@ function Install-LeonSourcesManual {
         [string]$TarExe
     )
 
-    $releaseTarball = Get-SingleFile -RootPath $ExpandedDistributionRoot -Filter 'vxworks-6.9-*.tar.gz'
+    $releaseTarball = Get-ReleaseArchive -RootPath $ExpandedDistributionRoot
+    if (-not $releaseTarball) {
+        throw "Could not find the LEON release archive under '$ExpandedDistributionRoot'."
+    }
     $backupRoot = Backup-WindRiverInstall -RootPath $WindRiverPath
     Write-Host "Backup saved to $backupRoot"
     Write-Host "Extracting LEON overlay into $WindRiverPath"
 
-    & $TarExe -xf $releaseTarball -C $WindRiverPath
+    & $TarExe -xf $releaseTarball.FullName -C $WindRiverPath
     if ($LASTEXITCODE -ne 0) {
-        throw "Failed to install LEON distribution from '$releaseTarball'."
+        throw "Failed to install LEON distribution from '$($releaseTarball.FullName)'."
     }
 
     return $backupRoot
@@ -526,6 +570,13 @@ try {
     }
     else {
         Write-Host "Local source folder not found: $SourceFilesRoot"
+    }
+
+    if (-not $ExpandedDistributionRoot) {
+        $ExpandedDistributionRoot = Find-ExpandedDistributionPath -SearchRoots @($SourceFilesRoot, $expandedRoot)
+        if ($ExpandedDistributionRoot) {
+            Write-Host "Found pre-expanded distribution: $ExpandedDistributionRoot"
+        }
     }
 
     $distributionZipPath = $null

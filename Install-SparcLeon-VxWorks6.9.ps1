@@ -10,6 +10,7 @@ param(
     [string]$WorkRoot,
     [switch]$SkipToolchainInstall,
     [switch]$SkipCompileGui,
+    [switch]$SkipBackup,
     [switch]$SkipElevation,
     [switch]$ValidateOnly,
     [switch]$NoPause
@@ -364,13 +365,32 @@ function Expand-TarArchive {
 function Copy-DirectoryTree {
     param(
         [string]$SourcePath,
-        [string]$DestinationPath
+        [string]$DestinationPath,
+        [string]$LogPath
     )
 
     Ensure-Directory -Path $DestinationPath
-    & robocopy $SourcePath $DestinationPath /E /COPY:DAT /R:2 /W:2 /NFL /NDL /NJH /NJS /NP | Out-Null
-    if ($LASTEXITCODE -gt 7) {
-        throw "Backup copy failed for '$SourcePath'."
+    $logDirectory = Split-Path -Parent $LogPath
+    Ensure-Directory -Path $logDirectory
+
+    $arguments = @(
+        $SourcePath,
+        $DestinationPath,
+        '/E',
+        '/COPY:DAT',
+        '/DCOPY:DAT',
+        '/XJ',
+        '/R:0',
+        '/W:0',
+        '/NP',
+        '/TEE',
+        "/LOG:`"$LogPath`""
+    )
+
+    & robocopy @arguments | Out-Null
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -gt 7) {
+        throw "Backup copy failed for '$SourcePath' (robocopy exit code $exitCode). See '$LogPath'."
     }
 }
 
@@ -390,7 +410,10 @@ function Assert-WindRiverLayout {
 }
 
 function Backup-WindRiverInstall {
-    param([string]$RootPath)
+    param(
+        [string]$RootPath,
+        [string]$LogRoot
+    )
 
     $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
     $backupRoot = Join-Path $RootPath "gr_manual_backup_$stamp"
@@ -399,8 +422,9 @@ function Backup-WindRiverInstall {
     foreach ($folderName in @('vxworks-6.9', 'components', 'workbench-3.3')) {
         $sourcePath = Join-Path $RootPath $folderName
         $destinationPath = Join-Path $backupRoot $folderName
+        $logPath = Join-Path $LogRoot ("backup-{0}-{1}.log" -f $folderName, $stamp)
         Write-Host "Backing up $folderName"
-        Copy-DirectoryTree -SourcePath $sourcePath -DestinationPath $destinationPath
+        Copy-DirectoryTree -SourcePath $sourcePath -DestinationPath $destinationPath -LogPath $logPath
     }
 
     return $backupRoot
@@ -495,15 +519,23 @@ function Install-LeonSourcesManual {
     param(
         [string]$WindRiverPath,
         [string]$ExpandedDistributionRoot,
-        [string]$TarExe
+        [string]$TarExe,
+        [string]$LogRoot,
+        [switch]$SkipBackup
     )
 
     $releaseTarball = Get-ReleaseArchive -RootPath $ExpandedDistributionRoot
     if (-not $releaseTarball) {
         throw "Could not find the LEON release archive under '$ExpandedDistributionRoot'."
     }
-    $backupRoot = Backup-WindRiverInstall -RootPath $WindRiverPath
-    Write-Host "Backup saved to $backupRoot"
+    $backupRoot = $null
+    if (-not $SkipBackup) {
+        $backupRoot = Backup-WindRiverInstall -RootPath $WindRiverPath -LogRoot $LogRoot
+        Write-Host "Backup saved to $backupRoot"
+    }
+    else {
+        Write-Warning 'Skipping backup by request.'
+    }
     Write-Host "Extracting LEON overlay into $WindRiverPath"
 
     & $TarExe -xf $releaseTarball.FullName -C $WindRiverPath
@@ -710,11 +742,13 @@ try {
         Write-Step 'Skipping GCC toolchain install by request'
     }
 
-    Write-Step 'Installing the LEON VxWorks sources using the documented manual overlay flow'
-    $backupRoot = Install-LeonSourcesManual `
-        -WindRiverPath $WindRiverRoot `
-        -ExpandedDistributionRoot $distExpandedRoot `
-        -TarExe $tarExe
+        Write-Step 'Installing the LEON VxWorks sources using the documented manual overlay flow'
+        $backupRoot = Install-LeonSourcesManual `
+            -WindRiverPath $WindRiverRoot `
+            -ExpandedDistributionRoot $distExpandedRoot `
+            -TarExe $tarExe `
+            -LogRoot $logRoot `
+            -SkipBackup:$SkipBackup
 
     if (-not $SkipCompileGui) {
         Write-Step 'Launching the vendor compile GUI'

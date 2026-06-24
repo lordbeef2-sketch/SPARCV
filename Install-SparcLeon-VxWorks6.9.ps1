@@ -1,782 +1,601 @@
-#requires -Version 5.1
-[CmdletBinding()]
 param(
-    [string]$WindRiverRoot = 'C:\WindRiver6.9',
-    [string]$SourceFilesRoot,
-    [string]$DownloadUser = 'VxWorks6',
-    [string]$DownloadPassword = $env:GAISLER_DOWNLOAD_PASSWORD,
-    [string]$DistributionPassword = 'password',
-    [string]$ExpandedDistributionRoot,
-    [string]$WorkRoot,
-    [switch]$SkipToolchainInstall,
-    [switch]$SkipCompileGui,
-    [switch]$SkipBackup,
-    [switch]$SkipElevation,
-    [switch]$ValidateOnly,
-    [switch]$NoPause
+    [switch]$AutoInstall
 )
 
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = "Stop"
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-if ([string]::IsNullOrWhiteSpace($SourceFilesRoot)) {
-    $SourceFilesRoot = Join-Path $PSScriptRoot 'InstallFiles'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+$ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+$PackRoot  = Join-Path $ScriptDir "DriverPack"
+$Manifest  = Join-Path $PackRoot "00_MANIFEST"
+$ManualDir = Join-Path $PackRoot "99_MANUAL_DOWNLOADS"
+$LogFile   = Join-Path $Manifest "driverpack.log"
+
+$global:LogBox = $null
+
+function New-Dir {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) {
+        New-Item -ItemType Directory -Force -Path $Path | Out-Null
+    }
 }
 
-if ([string]::IsNullOrWhiteSpace($WorkRoot)) {
-    $WorkRoot = Join-Path $PSScriptRoot 'artifacts'
-}
-
-$script:Config = [ordered]@{
-    ProductName            = 'Frontgrade Gaisler SPARC/LEON VxWorks 6.9'
-    ReleaseVersion         = '2.3.0'
-    RequiredVxWorks        = '6.9.4.12 RCPL8'
-    RequiredWorkbench      = 'Workbench 3.3 Update 6'
-    ToolchainVersion       = '4.9-1.0.7'
-    DownloadBaseUrl        = 'https://download.gaisler.com/products/vxworks6.9'
-    DistributionZipName    = 'dist-vxworks-6.9-2.3.0.tar.gz.zip'
-    ToolchainInstallerName = 'sparc-wrs-vxworks-4.9-1.0.7-mingw.exe'
-    ToolchainZipName       = 'sparc-wrs-vxworks-4.9-1.0.7-mingw.zip'
-    GuidePdfName           = 'vxworks-installing-6.9-2.3.0.pdf'
-    SevenZipInstallerUrl   = 'https://github.com/ip7z/7zip/releases/download/26.01/7z2601-x64.exe'
-    SevenZipInstallerName  = '7z2601-x64.exe'
-    SevenZipInstallDirName = '7-Zip'
-    ToolchainInstallRoot   = 'C:\opt'
-    ToolchainInstallDir    = 'C:\opt\sparc-wrs-vxworks'
-    ToolchainBinDir        = 'C:\opt\sparc-wrs-vxworks\bin'
-}
-
-function Write-Step {
+function Log {
     param([string]$Message)
-    Write-Host ''
-    Write-Host "==> $Message" -ForegroundColor Cyan
+
+    New-Dir $Manifest
+
+    $line = "[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message
+
+    if ($global:LogBox) {
+        $global:LogBox.AppendText("$line`r`n")
+        $global:LogBox.SelectionStart = $global:LogBox.Text.Length
+        $global:LogBox.ScrollToCaret()
+    }
+
+    Write-Host $line
+    Add-Content -Path $LogFile -Value $line
 }
 
-function Test-Administrator {
+function SafeName {
+    param([string]$Name)
+    return ($Name -replace '[\\/:*?"<>|]', '_' -replace '\s+', '_')
+}
+
+function Test-IsAdmin {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-function Restart-Elevated {
-    $argumentList = @(
-        '-NoProfile',
-        '-ExecutionPolicy',
-        'Bypass',
-        '-File',
-        ('"{0}"' -f $PSCommandPath)
+function Write-UrlShortcut {
+    param(
+        [string]$Path,
+        [string]$Url
     )
 
-    foreach ($entry in $PSBoundParameters.GetEnumerator()) {
-        if ($entry.Value -is [System.Management.Automation.SwitchParameter]) {
-            if ($entry.Value.IsPresent) {
-                $argumentList += "-$($entry.Key)"
-            }
-            continue
+@"
+[InternetShortcut]
+URL=$Url
+"@ | Set-Content -Path $Path -Encoding ASCII
+}
+
+function Download-File {
+    param(
+        [string]$Url,
+        [string]$Destination
+    )
+
+    New-Dir (Split-Path $Destination -Parent)
+
+    if (Test-Path $Destination) {
+        Log "SKIP exists: $Destination"
+        return
+    }
+
+    Log "Downloading: $Url"
+    Log "To: $Destination"
+
+    try {
+        Start-BitsTransfer -Source $Url -Destination $Destination -ErrorAction Stop
+    }
+    catch {
+        Log "BITS failed. Falling back to Invoke-WebRequest."
+        Invoke-WebRequest -Uri $Url -OutFile $Destination -UseBasicParsing
+    }
+}
+
+$Items = @(
+    [pscustomobject]@{
+        Order        = 10
+        Vendor       = "Keysight"
+        Name         = "IO Libraries Suite"
+        Models       = "Required prerequisite"
+        Folder       = "01_KEYSIGHT\00_IO_Libraries"
+        Type         = "Manual"
+        Url          = ""
+        FileName     = ""
+        Page         = "https://www.keysight.com/us/en/lib/software-detail/computer-software/io-libraries-suite-downloads-2175637.html"
+        Notes        = "Install before Keysight IVI drivers."
+    },
+
+    [pscustomobject]@{
+        Order        = 20
+        Vendor       = "Keysight"
+        Name         = "InfiniiVision X-Series Oscilloscope IVI Driver"
+        Models       = "DSOX2024A"
+        Folder       = "01_KEYSIGHT\01_DSOX2024A_InfiniiVision"
+        Type         = "Manual"
+        Url          = ""
+        FileName     = ""
+        Page         = "https://www.keysight.com/us/en/lib/software-detail/driver/infiniivision-x-series-oscilloscope-ivi-instrument-drivers.html"
+        Notes        = "Scope IVI driver."
+    },
+
+    [pscustomobject]@{
+        Order        = 30
+        Vendor       = "Keysight"
+        Name         = "N67xx Modular Power Supply IVI Driver"
+        Models       = "N6701C, N6733B, N6751A"
+        Folder       = "01_KEYSIGHT\02_N6700_Modular_Power"
+        Type         = "Manual"
+        Url          = ""
+        FileName     = ""
+        Page         = "https://www.keysight.com/us/en/lib/software-detail/driver/n67xx-modular-power-supply-ivi-and-matlab-instrument-drivers-1960676.html"
+        Notes        = "Mainframe plus modules."
+    },
+
+    [pscustomobject]@{
+        Order        = 40
+        Vendor       = "Keysight"
+        Name         = "N6900/N7900/RP7900 APS IVI Driver"
+        Models       = "N6972A, RP7932A"
+        Folder       = "01_KEYSIGHT\03_N6900_N7900_RP7900_APS"
+        Type         = "Manual"
+        Url          = ""
+        FileName     = ""
+        Page         = "https://www.keysight.com/us/en/lib/software-detail/driver/advanced-power-system-n6900-n7900-and-rp7900-series-ivi-and-matlab-instrument-drivers-2379610.html"
+        Notes        = "Advanced Power System driver."
+    },
+
+    [pscustomobject]@{
+        Order        = 50
+        Vendor       = "Keysight"
+        Name         = "N57xx/N87xx DC Power Supply IVI Driver"
+        Models       = "N5750A"
+        Folder       = "01_KEYSIGHT\04_N57xx_N87xx"
+        Type         = "Manual"
+        Url          = ""
+        FileName     = ""
+        Page         = "https://www.keysight.com/us/en/lib/software-detail/driver/n57xx-n87xx-dc-power-supply-ivi-and-matlab-instrument-drivers-1670385.html"
+        Notes        = "N5750A driver family."
+    },
+
+    [pscustomobject]@{
+        Order        = 60
+        Vendor       = "Keysight"
+        Name         = "MP4300 Modular Power System IVI Driver"
+        Models       = "MP4301A"
+        Folder       = "01_KEYSIGHT\05_MP4300"
+        Type         = "Manual"
+        Url          = ""
+        FileName     = ""
+        Page         = "https://www.keysight.com/us/en/lib/software-detail/driver/mp4300-modular-power-system-ivi-instrument-drivers.html"
+        Notes        = "MP4301A driver family."
+    },
+
+    [pscustomobject]@{
+        Order        = 70
+        Vendor       = "Chroma"
+        Name         = "63200A LabVIEW Driver"
+        Models       = "63203A-150-200"
+        Folder       = "02_CHROMA\63200A"
+        Type         = "Direct"
+        Url          = "https://www.chromaate.com/downloads/drivers/63200A_series/Chr63200A_LabVIEW.zip"
+        FileName     = "Chr63200A_LabVIEW.zip"
+        Page         = "https://www.chromaate.com/en/data_center/63200a_series_dc_electronic_load"
+        Notes        = "LabVIEW driver ZIP."
+    },
+
+    [pscustomobject]@{
+        Order        = 71
+        Vendor       = "Chroma"
+        Name         = "63200A LabWindows Driver"
+        Models       = "63203A-150-200"
+        Folder       = "02_CHROMA\63200A"
+        Type         = "Direct"
+        Url          = "https://www.chromaate.com/downloads/drivers/63200A_series/Chr63200A_LabWindows.zip"
+        FileName     = "Chr63200A_LabWindows.zip"
+        Page         = "https://www.chromaate.com/en/data_center/63200a_series_dc_electronic_load"
+        Notes        = "LabWindows/CVI driver ZIP."
+    },
+
+    [pscustomobject]@{
+        Order        = 80
+        Vendor       = "Pickering"
+        Name         = "PXI/LXI Driver Package"
+        Models       = "40-670C-022-99/2, 40-290-021, 42-411A-001, 60-106-002"
+        Folder       = "03_PICKERING\PXI_LXI_Drivers"
+        Type         = "Manual"
+        Url          = ""
+        FileName     = ""
+        Page         = "https://downloads.pickeringtest.info/downloads/drivers/PXI_Drivers/"
+        Notes        = "Download latest package from official directory."
+    },
+
+    [pscustomobject]@{
+        Order        = 81
+        Vendor       = "Pickering"
+        Name         = "PXI Driver Release Notes"
+        Models       = "Reference"
+        Folder       = "03_PICKERING\PXI_LXI_Drivers"
+        Type         = "Direct"
+        Url          = "https://downloads.pickeringtest.info/downloads/drivers/PXI_Drivers/Release%20Notes.txt"
+        FileName     = "Pickering_PXI_Driver_Release_Notes.txt"
+        Page         = "https://downloads.pickeringtest.info/downloads/drivers/PXI_Drivers/"
+        Notes        = "Reference only."
+    },
+
+    [pscustomobject]@{
+        Order        = 90
+        Vendor       = "Ballard/Astronics"
+        Name         = "BTIDriver / Avionics Interface Driver"
+        Models       = "1553 2-channel"
+        Folder       = "04_BALLARD_ASTRONICS"
+        Type         = "Manual"
+        Url          = ""
+        FileName     = ""
+        Page         = "https://www.astronics.com/avionics-interface-driver-software"
+        Notes        = "Vendor gated/support download."
+    },
+
+    [pscustomobject]@{
+        Order        = 91
+        Vendor       = "NI / Astronics"
+        Name         = "Astronics Ballard Avionics Driver"
+        Models       = "NI-branded PXI/PXIe Ballard modules"
+        Folder       = "04_BALLARD_ASTRONICS\NI_Ballard_Driver_Page"
+        Type         = "Manual"
+        Url          = ""
+        FileName     = ""
+        Page         = "https://www.ni.com/en/support/downloads/drivers/download.astronics-ballard-avionics-driver.html"
+        Notes        = "Use this if hardware is NI-branded."
+    },
+
+    [pscustomobject]@{
+        Order        = 100
+        Vendor       = "AP Instruments / Ridley"
+        Name         = "Model 300/310 Software"
+        Models       = "Ridley AP310"
+        Folder       = "05_RIDLEY_AP310"
+        Type         = "Manual"
+        Url          = ""
+        FileName     = ""
+        Page         = "https://www.apinstruments.com/downloads.html"
+        Notes        = "Manual download."
+    },
+
+    [pscustomobject]@{
+        Order        = 110
+        Vendor       = "Devantech"
+        Name         = "dScript Windows Installer"
+        Models       = "DS2832"
+        Folder       = "06_DEVANTECH_DS2832"
+        Type         = "Direct"
+        Url          = "https://www.robot-electronics.co.uk/files/dScript-4.16.msi"
+        FileName     = "dScript-4.16.msi"
+        Page         = "https://www.robot-electronics.co.uk/dscript.html"
+        Notes        = "dScript software."
+    },
+
+    [pscustomobject]@{
+        Order        = 120
+        Vendor       = "Samsung"
+        Name         = "Samsung Magician"
+        Models       = "Unknown Samsung 960GB SSD"
+        Folder       = "07_SAMSUNG_SSD"
+        Type         = "Direct"
+        Url          = "https://download.semiconductor.samsung.com/resources/software-resources/Samsung_Magician_Installer_Official_9.0.1.950.exe"
+        FileName     = "Samsung_Magician_Installer_Official_9.0.1.950.exe"
+        Page         = "https://semiconductor.samsung.com/consumer-storage/support/tools/"
+        Notes        = "Use to identify SSD."
+    },
+
+    [pscustomobject]@{
+        Order        = 121
+        Vendor       = "Samsung"
+        Name         = "Samsung NVMe Driver"
+        Models       = "950/960/970 family only"
+        Folder       = "07_SAMSUNG_SSD"
+        Type         = "Direct"
+        Url          = "https://semiconductor.samsung.com/resources/software-resources/Samsung_NVM_Express_Driver_3.3.exe"
+        FileName     = "Samsung_NVM_Express_Driver_3.3.exe"
+        Page         = "https://semiconductor.samsung.com/consumer-storage/support/tools/"
+        Notes        = "Downloaded but skipped during auto install. Run manually only if compatible."
+    }
+)
+
+function Invoke-PrepDownload {
+    Log "=== PREP / DOWNLOAD START ==="
+    Log "Script folder: $ScriptDir"
+    Log "Driver pack folder: $PackRoot"
+
+    New-Dir $PackRoot
+    New-Dir $Manifest
+    New-Dir $ManualDir
+
+    foreach ($item in $Items) {
+        New-Dir (Join-Path $PackRoot $item.Folder)
+    }
+
+    $Items | Export-Csv -Path (Join-Path $Manifest "driver_manifest.csv") -NoTypeInformation
+    $Items | ConvertTo-Json -Depth 5 | Set-Content -Path (Join-Path $Manifest "driver_manifest.json") -Encoding UTF8
+
+    $manualMd = Join-Path $ManualDir "MANUAL_DOWNLOADS.md"
+    $manualHtml = Join-Path $ManualDir "MANUAL_DOWNLOADS.html"
+
+    $md = @()
+    $md += "# Manual Downloads"
+    $md += ""
+    $md += "Download manual/session-gated installers and drop them into the matching folders."
+    $md += ""
+
+    $html = @()
+    $html += "<html><body><h1>Manual Downloads</h1>"
+    $html += "<p>Download manual/session-gated installers and drop them into the matching folders.</p>"
+
+    foreach ($item in $Items) {
+        $folderPath = Join-Path $PackRoot $item.Folder
+
+        if ($item.Page) {
+            $shortcut = Join-Path $folderPath ("{0}_OfficialPage.url" -f (SafeName "$($item.Vendor)_$($item.Name)"))
+            Write-UrlShortcut -Path $shortcut -Url $item.Page
         }
 
-        if ($null -ne $entry.Value -and $entry.Value -ne '') {
-            $argumentList += "-$($entry.Key)"
-            $argumentList += ('"{0}"' -f ($entry.Value.ToString().Replace('"', '\"')))
+        if ($item.Type -eq "Manual") {
+            $md += "## $($item.Vendor) - $($item.Name)"
+            $md += "- Models: $($item.Models)"
+            $md += "- Folder: ``$folderPath``"
+            $md += "- Page: $($item.Page)"
+            $md += "- Notes: $($item.Notes)"
+            $md += ""
+
+            $html += "<h2>$($item.Vendor) - $($item.Name)</h2>"
+            $html += "<p><b>Models:</b> $($item.Models)</p>"
+            $html += "<p><b>Folder:</b> $folderPath</p>"
+            $html += "<p><a href='$($item.Page)'>Open official page</a></p>"
+            $html += "<p><b>Notes:</b> $($item.Notes)</p>"
         }
     }
 
-    Start-Process -FilePath 'powershell.exe' -ArgumentList $argumentList -Verb RunAs | Out-Null
+    $html += "</body></html>"
+
+    $md | Set-Content -Path $manualMd -Encoding UTF8
+    $html | Set-Content -Path $manualHtml -Encoding UTF8
+
+    foreach ($item in $Items | Where-Object { $_.Type -eq "Direct" }) {
+        $dest = Join-Path (Join-Path $PackRoot $item.Folder) $item.FileName
+
+        try {
+            Download-File -Url $item.Url -Destination $dest
+        }
+        catch {
+            Log "FAILED download: $($item.Name)"
+            Log $_.Exception.Message
+        }
+    }
+
+    $hashPath = Join-Path $Manifest "sha256_hashes.csv"
+
+    Get-ChildItem $PackRoot -Recurse -File |
+        Where-Object {
+            $_.Extension -match '^\.(exe|msi|zip|iso)$'
+        } |
+        Get-FileHash -Algorithm SHA256 |
+        Select-Object Path, Hash |
+        Export-Csv -Path $hashPath -NoTypeInformation
+
+    Log "Manifest written: $(Join-Path $Manifest 'driver_manifest.csv')"
+    Log "Manual download list: $manualMd"
+    Log "Manual download HTML: $manualHtml"
+    Log "Hashes written: $hashPath"
+
+    $answer = [System.Windows.Forms.MessageBox]::Show(
+        "Prep/download complete.`n`nOpen the manual download page list now?",
+        "Driver Pack",
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Question
+    )
+
+    if ($answer -eq [System.Windows.Forms.DialogResult]::Yes) {
+        Start-Process $manualHtml
+        Start-Process $ManualDir
+    }
+
+    Log "=== PREP / DOWNLOAD COMPLETE ==="
+}
+
+function Invoke-InstallPack {
+    Log "=== INSTALL START ==="
+
+    if (-not (Test-Path $PackRoot)) {
+        Log "DriverPack folder not found. Run Prep / Download first."
+        return
+    }
+
+    $installerExt = @(".msi", ".exe", ".zip")
+    $skipNames = @(
+        "Samsung_NVM_Express_Driver_3.3.exe"
+    )
+
+    foreach ($item in $Items | Sort-Object Order) {
+        $folder = Join-Path $PackRoot $item.Folder
+
+        if (-not (Test-Path $folder)) {
+            Log "Missing folder: $folder"
+            continue
+        }
+
+        $files = Get-ChildItem $folder -Recurse -File |
+            Where-Object {
+                $installerExt -contains $_.Extension.ToLower() -and
+                $_.FullName -notmatch "\\EXTRACTED_"
+            } |
+            Sort-Object FullName
+
+        if (-not $files) {
+            Log "No installer found for: $($item.Vendor) - $($item.Name)"
+            continue
+        }
+
+        foreach ($file in $files) {
+            if ($skipNames -contains $file.Name) {
+                Log "SKIP protected/manual installer: $($file.FullName)"
+                continue
+            }
+
+            Log "Processing: $($file.FullName)"
+
+            switch ($file.Extension.ToLower()) {
+                ".zip" {
+                    $extractTo = Join-Path $file.DirectoryName ("EXTRACTED_" + $file.BaseName)
+
+                    New-Dir $extractTo
+                    Log "Extracting ZIP to: $extractTo"
+
+                    try {
+                        Expand-Archive -Path $file.FullName -DestinationPath $extractTo -Force
+                    }
+                    catch {
+                        Log "ZIP extraction failed: $($_.Exception.Message)"
+                    }
+
+                    $nestedInstallers = Get-ChildItem $extractTo -Recurse -File |
+                        Where-Object { $_.Extension.ToLower() -in @(".msi", ".exe") } |
+                        Sort-Object FullName
+
+                    foreach ($nested in $nestedInstallers) {
+                        Log "Launching extracted installer: $($nested.FullName)"
+
+                        if ($nested.Extension.ToLower() -eq ".msi") {
+                            Start-Process "msiexec.exe" -ArgumentList "/i `"$($nested.FullName)`"" -Wait
+                        }
+                        else {
+                            Start-Process $nested.FullName -Wait
+                        }
+                    }
+                }
+
+                ".msi" {
+                    Log "Launching MSI installer."
+                    Start-Process "msiexec.exe" -ArgumentList "/i `"$($file.FullName)`"" -Wait
+                }
+
+                ".exe" {
+                    Log "Launching EXE installer."
+                    Start-Process $file.FullName -Wait
+                }
+            }
+        }
+    }
+
+    Log "=== INSTALL COMPLETE ==="
+
+    [System.Windows.Forms.MessageBox]::Show(
+        "Install pass complete.`n`nCheck the log and vendor installers for any prompts/errors.",
+        "Driver Pack",
+        [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Information
+    ) | Out-Null
+}
+
+if ($AutoInstall) {
+    New-Dir $Manifest
+    Invoke-InstallPack
     exit
 }
 
-function Ensure-Directory {
-    param([string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) {
-        New-Item -ItemType Directory -Path $Path -Force | Out-Null
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "Driver Pack Builder"
+$form.Size = New-Object System.Drawing.Size(900, 620)
+$form.StartPosition = "CenterScreen"
+
+$title = New-Object System.Windows.Forms.Label
+$title.Text = "Driver Pack Builder"
+$title.Font = New-Object System.Drawing.Font("Segoe UI", 16, [System.Drawing.FontStyle]::Bold)
+$title.AutoSize = $true
+$title.Location = New-Object System.Drawing.Point(20, 15)
+$form.Controls.Add($title)
+
+$pathLabel = New-Object System.Windows.Forms.Label
+$pathLabel.Text = "Pack folder: $PackRoot"
+$pathLabel.AutoSize = $true
+$pathLabel.Location = New-Object System.Drawing.Point(23, 55)
+$form.Controls.Add($pathLabel)
+
+$prepButton = New-Object System.Windows.Forms.Button
+$prepButton.Text = "Prep / Download"
+$prepButton.Size = New-Object System.Drawing.Size(180, 45)
+$prepButton.Location = New-Object System.Drawing.Point(25, 90)
+$prepButton.Font = New-Object System.Drawing.Font("Segoe UI", 11, [System.Drawing.FontStyle]::Bold)
+$form.Controls.Add($prepButton)
+
+$installButton = New-Object System.Windows.Forms.Button
+$installButton.Text = "Install"
+$installButton.Size = New-Object System.Drawing.Size(180, 45)
+$installButton.Location = New-Object System.Drawing.Point(220, 90)
+$installButton.Font = New-Object System.Drawing.Font("Segoe UI", 11, [System.Drawing.FontStyle]::Bold)
+$form.Controls.Add($installButton)
+
+$note = New-Object System.Windows.Forms.Label
+$note.Text = "Prep creates folders, downloads direct files, writes manifests, and opens manual-download links. Install launches local installers in order."
+$note.AutoSize = $true
+$note.Location = New-Object System.Drawing.Point(25, 150)
+$form.Controls.Add($note)
+
+$logBox = New-Object System.Windows.Forms.TextBox
+$logBox.Multiline = $true
+$logBox.ScrollBars = "Vertical"
+$logBox.ReadOnly = $true
+$logBox.Font = New-Object System.Drawing.Font("Consolas", 9)
+$logBox.Location = New-Object System.Drawing.Point(25, 180)
+$logBox.Size = New-Object System.Drawing.Size(835, 360)
+$form.Controls.Add($logBox)
+
+$global:LogBox = $logBox
+
+$prepButton.Add_Click({
+    try {
+        Invoke-PrepDownload
     }
-}
-
-function Read-PlainSecret {
-    param([string]$PromptText)
-    $secureValue = Read-Host -Prompt $PromptText -AsSecureString
-    return [System.Net.NetworkCredential]::new('', $secureValue).Password
-}
-
-function Get-SecretValue {
-    param(
-        [string]$Value,
-        [string]$PromptText
-    )
-
-    if ([string]::IsNullOrWhiteSpace($Value)) {
-        return Read-PlainSecret -PromptText $PromptText
+    catch {
+        Log "ERROR: $($_.Exception.Message)"
+        [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "Prep / Download Error")
     }
+})
 
-    return $Value
-}
+$installButton.Add_Click({
+    try {
+        if (-not (Test-IsAdmin)) {
+            $answer = [System.Windows.Forms.MessageBox]::Show(
+                "Driver installation should run as Administrator.`n`nRelaunch elevated and start install now?",
+                "Admin Required",
+                [System.Windows.Forms.MessageBoxButtons]::YesNo,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
+            )
 
-function Assert-Command {
-    param([string]$Name)
-    $command = Get-Command -Name $Name -ErrorAction SilentlyContinue
-    if (-not $command) {
-        throw "Required command '$Name' was not found."
-    }
+            if ($answer -eq [System.Windows.Forms.DialogResult]::Yes) {
+                Start-Process "powershell.exe" `
+                    -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -AutoInstall" `
+                    -Verb RunAs
 
-    return $command.Source
-}
-
-function Invoke-Download {
-    param(
-        [string]$Uri,
-        [pscredential]$Credential,
-        [string]$DestinationPath
-    )
-
-    if (Test-Path -LiteralPath $DestinationPath) {
-        Write-Host "Reusing $(Split-Path -Leaf $DestinationPath)"
-        return
-    }
-
-    Write-Host "Downloading $(Split-Path -Leaf $DestinationPath)"
-    Invoke-WebRequest -Uri $Uri -Credential $Credential -OutFile $DestinationPath
-}
-
-function Find-ArtifactPath {
-    param(
-        [string]$FileName,
-        [string[]]$SearchRoots,
-        [switch]$Required
-    )
-
-    foreach ($root in $SearchRoots) {
-        if ([string]::IsNullOrWhiteSpace($root)) {
-            continue
-        }
-
-        $candidate = Join-Path $root $FileName
-        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
-            return (Resolve-Path -LiteralPath $candidate).Path
-        }
-    }
-
-    if ($Required) {
-        $locations = ($SearchRoots | Where-Object { $_ }) -join ', '
-        throw "Required artifact '$FileName' was not found. Checked: $locations"
-    }
-
-    return $null
-}
-
-function Get-ReleaseArchive {
-    param([string]$RootPath)
-
-    foreach ($filter in @('vxworks-6.9-*-src.tar', 'vxworks-6.9-*.tar.gz', 'vxworks-6.9-*.tar')) {
-        $match = Get-ChildItem -Path $RootPath -Recurse -File -Filter $filter -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($match) {
-            return $match
-        }
-    }
-
-    return $null
-}
-
-function Get-DistributionRootFromPath {
-    param([string]$Path)
-
-    if ([string]::IsNullOrWhiteSpace($Path)) {
-        return $null
-    }
-
-    if (-not (Test-Path -LiteralPath $Path)) {
-        throw "Expanded distribution root '$Path' does not exist."
-    }
-
-    $resolvedPath = (Resolve-Path -LiteralPath $Path).Path
-    $releaseTarball = Get-ReleaseArchive -RootPath $resolvedPath
-    if (-not $releaseTarball) {
-        throw "Expanded distribution root '$resolvedPath' does not contain a release archive such as vxworks-6.9-*-src.tar."
-    }
-
-    $releaseDirectory = Split-Path -Parent $releaseTarball.FullName
-    if ((Split-Path -Leaf $releaseDirectory) -ieq 'release') {
-        return (Split-Path -Parent $releaseDirectory)
-    }
-
-    return $resolvedPath
-}
-
-function Find-ExpandedDistributionPath {
-    param([string[]]$SearchRoots)
-
-    foreach ($root in $SearchRoots) {
-        if ([string]::IsNullOrWhiteSpace($root) -or -not (Test-Path -LiteralPath $root)) {
-            continue
-        }
-
-        try {
-            return Get-DistributionRootFromPath -Path $root
-        }
-        catch {
-        }
-
-        $releaseMatch = Get-ReleaseArchive -RootPath $root
-        if ($releaseMatch) {
-            $releaseDirectory = Split-Path -Parent $releaseMatch.FullName
-            if ((Split-Path -Leaf $releaseDirectory) -ieq 'release') {
-                return (Split-Path -Parent $releaseDirectory)
+                $form.Close()
             }
 
-            return (Split-Path -Parent $releaseMatch.FullName)
-        }
-    }
-
-    return $null
-}
-
-function Resolve-DownloadCredential {
-    param(
-        [string]$UserName,
-        [string]$Password
-    )
-
-    $resolvedPassword = Get-SecretValue `
-        -Value $Password `
-        -PromptText "Enter the Gaisler web-download password for user '$UserName'"
-    $securePassword = ConvertTo-SecureString $resolvedPassword -AsPlainText -Force
-    return New-Object System.Management.Automation.PSCredential($UserName, $securePassword)
-}
-
-function Invoke-Process {
-    param(
-        [string]$FilePath,
-        [string[]]$ArgumentList,
-        [int[]]$SuccessExitCodes = @(0),
-        [string]$Description = $FilePath
-    )
-
-    Write-Host $Description
-    $process = Start-Process -FilePath $FilePath -ArgumentList ($ArgumentList -join ' ') -Wait -PassThru
-    if ($SuccessExitCodes -notcontains $process.ExitCode) {
-        throw "'$Description' failed with exit code $($process.ExitCode)."
-    }
-}
-
-function Add-PathEntry {
-    param(
-        [string]$PathEntry,
-        [ValidateSet('Machine', 'User')]
-        [string]$Scope = 'Machine'
-    )
-
-    $currentValue = [Environment]::GetEnvironmentVariable('Path', $Scope)
-    $entries = @()
-    if (-not [string]::IsNullOrWhiteSpace($currentValue)) {
-        $entries = $currentValue -split ';' | Where-Object { $_ }
-    }
-
-    $alreadyPresent = $false
-    foreach ($entry in $entries) {
-        if ($entry.TrimEnd('\') -ieq $PathEntry.TrimEnd('\')) {
-            $alreadyPresent = $true
-            break
-        }
-    }
-
-    if (-not $alreadyPresent) {
-        $newValue = (($entries + $PathEntry) -join ';')
-        [Environment]::SetEnvironmentVariable('Path', $newValue, $Scope)
-    }
-
-    $sessionEntries = $env:Path -split ';' | Where-Object { $_ }
-    $sessionPresent = $false
-    foreach ($entry in $sessionEntries) {
-        if ($entry.TrimEnd('\') -ieq $PathEntry.TrimEnd('\')) {
-            $sessionPresent = $true
-            break
-        }
-    }
-
-    if (-not $sessionPresent) {
-        $env:Path = "$PathEntry;$env:Path"
-    }
-}
-
-function Install-LocalSevenZip {
-    param([string]$ToolsRoot)
-
-    $sevenZipHome = Join-Path $ToolsRoot $script:Config.SevenZipInstallDirName
-    $sevenZipExe = Join-Path $sevenZipHome '7z.exe'
-    if (Test-Path -LiteralPath $sevenZipExe) {
-        return $sevenZipExe
-    }
-
-    Ensure-Directory -Path $ToolsRoot
-    $installerPath = Join-Path $ToolsRoot $script:Config.SevenZipInstallerName
-    if (-not (Test-Path -LiteralPath $installerPath)) {
-        Write-Host "Downloading $($script:Config.SevenZipInstallerName)"
-        Invoke-WebRequest -Uri $script:Config.SevenZipInstallerUrl -OutFile $installerPath
-    }
-
-    Invoke-Process `
-        -FilePath $installerPath `
-        -ArgumentList @('/S', ('/D="{0}"' -f $sevenZipHome)) `
-        -Description 'Installing 7-Zip command line tools'
-
-    if (-not (Test-Path -LiteralPath $sevenZipExe)) {
-        throw '7-Zip was installed, but 7z.exe was not found afterwards.'
-    }
-
-    return $sevenZipExe
-}
-
-function Expand-EncryptedZip {
-    param(
-        [string]$SevenZipExe,
-        [string]$ArchivePath,
-        [string]$Password,
-        [string]$DestinationPath
-    )
-
-    Ensure-Directory -Path $DestinationPath
-    Invoke-Process `
-        -FilePath $SevenZipExe `
-        -ArgumentList @(
-            'x',
-            ('"{0}"' -f $ArchivePath),
-            ('-o"{0}"' -f $DestinationPath),
-            '-aoa',
-            '-y',
-            ('-p"{0}"' -f $Password)
-        ) `
-        -SuccessExitCodes @(0, 1) `
-        -Description 'Extracting password-protected Gaisler archive'
-}
-
-function Expand-TarArchive {
-    param(
-        [string]$TarExe,
-        [string]$ArchivePath,
-        [string]$DestinationPath
-    )
-
-    Ensure-Directory -Path $DestinationPath
-    & $TarExe -xf $ArchivePath -C $DestinationPath
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to extract archive '$ArchivePath'."
-    }
-}
-
-function Copy-DirectoryTree {
-    param(
-        [string]$SourcePath,
-        [string]$DestinationPath,
-        [string]$LogPath
-    )
-
-    Ensure-Directory -Path $DestinationPath
-    $logDirectory = Split-Path -Parent $LogPath
-    Ensure-Directory -Path $logDirectory
-
-    $arguments = @(
-        $SourcePath,
-        $DestinationPath,
-        '/E',
-        '/COPY:DAT',
-        '/DCOPY:DAT',
-        '/XJ',
-        '/R:0',
-        '/W:0',
-        '/NP',
-        '/TEE',
-        "/LOG:`"$LogPath`""
-    )
-
-    & robocopy @arguments | Out-Null
-    $exitCode = $LASTEXITCODE
-    if ($exitCode -gt 7) {
-        throw "Backup copy failed for '$SourcePath' (robocopy exit code $exitCode). See '$LogPath'."
-    }
-}
-
-function Assert-WindRiverLayout {
-    param([string]$RootPath)
-
-    if (-not (Test-Path -LiteralPath $RootPath)) {
-        throw "Wind River root '$RootPath' does not exist."
-    }
-
-    foreach ($requiredFolder in @('vxworks-6.9', 'components', 'workbench-3.3')) {
-        $fullPath = Join-Path $RootPath $requiredFolder
-        if (-not (Test-Path -LiteralPath $fullPath)) {
-            throw "Expected folder '$fullPath' was not found."
-        }
-    }
-}
-
-function Backup-WindRiverInstall {
-    param(
-        [string]$RootPath,
-        [string]$LogRoot
-    )
-
-    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
-    $backupRoot = Join-Path $RootPath "gr_manual_backup_$stamp"
-    Ensure-Directory -Path $backupRoot
-
-    foreach ($folderName in @('vxworks-6.9', 'components', 'workbench-3.3')) {
-        $sourcePath = Join-Path $RootPath $folderName
-        $destinationPath = Join-Path $backupRoot $folderName
-        $logPath = Join-Path $LogRoot ("backup-{0}-{1}.log" -f $folderName, $stamp)
-        Write-Host "Backing up $folderName"
-        Copy-DirectoryTree -SourcePath $sourcePath -DestinationPath $destinationPath -LogPath $logPath
-    }
-
-    return $backupRoot
-}
-
-function Get-SingleFile {
-    param(
-        [string]$RootPath,
-        [string]$Filter
-    )
-
-    $match = Get-ChildItem -Path $RootPath -Recurse -File -Filter $Filter | Select-Object -First 1
-    if (-not $match) {
-        throw "Could not find '$Filter' under '$RootPath'."
-    }
-
-    return $match.FullName
-}
-
-function Install-GccToolchain {
-    param(
-        [string]$InstallerPath,
-        [string]$ZipPath,
-        [string]$LogPath,
-        [string]$SevenZipExe,
-        [string]$ScratchRoot
-    )
-
-    if (Test-Path -LiteralPath $script:Config.ToolchainBinDir) {
-        Write-Host "Reusing existing GCC toolchain at $($script:Config.ToolchainBinDir)"
-        Add-PathEntry -PathEntry $script:Config.ToolchainBinDir
-        return
-    }
-
-    if ($ZipPath -and (Test-Path -LiteralPath $ZipPath)) {
-        Write-Host "Installing LEON GCC toolchain from ZIP: $ZipPath"
-        Ensure-Directory -Path $script:Config.ToolchainInstallRoot
-
-        $extractRoot = Join-Path $ScratchRoot 'toolchain-zip'
-        if (Test-Path -LiteralPath $extractRoot) {
-            Remove-Item -LiteralPath $extractRoot -Recurse -Force
-        }
-        Ensure-Directory -Path $extractRoot
-
-        Invoke-Process `
-            -FilePath $SevenZipExe `
-            -ArgumentList @(
-                'x',
-                ('"{0}"' -f $ZipPath),
-                ('-o"{0}"' -f $extractRoot),
-                '-aoa',
-                '-y'
-            ) `
-            -SuccessExitCodes @(0, 1) `
-            -Description 'Extracting LEON GCC toolchain ZIP'
-
-        $extractedRoot = Get-ChildItem -Path $extractRoot -Directory | Select-Object -First 1
-        if (-not $extractedRoot) {
-            throw "Could not find the extracted GCC toolchain folder under '$extractRoot'."
+            return
         }
 
-        if (Test-Path -LiteralPath $script:Config.ToolchainInstallDir) {
-            Remove-Item -LiteralPath $script:Config.ToolchainInstallDir -Recurse -Force
-        }
+        $confirm = [System.Windows.Forms.MessageBox]::Show(
+            "Install will launch installers found under:`n`n$PackRoot`n`nContinue?",
+            "Start Install",
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Question
+        )
 
-        Move-Item -LiteralPath $extractedRoot.FullName -Destination $script:Config.ToolchainInstallDir
-    }
-    elseif ($InstallerPath -and (Test-Path -LiteralPath $InstallerPath)) {
-        Invoke-Process `
-            -FilePath $InstallerPath `
-            -ArgumentList @(
-                '/VERYSILENT',
-                '/SUPPRESSMSGBOXES',
-                '/NORESTART',
-                '/SP-',
-                ('/LOG="{0}"' -f $LogPath)
-            ) `
-            -Description 'Installing LEON GCC toolchain'
-    }
-    else {
-        throw 'Neither the LEON GCC installer EXE nor the ZIP archive was found.'
-    }
-
-    if (-not (Test-Path -LiteralPath $script:Config.ToolchainBinDir)) {
-        throw "Expected GCC bin folder '$($script:Config.ToolchainBinDir)' was not created."
-    }
-
-    Add-PathEntry -PathEntry $script:Config.ToolchainBinDir
-}
-
-function Install-LeonSourcesManual {
-    param(
-        [string]$WindRiverPath,
-        [string]$ExpandedDistributionRoot,
-        [string]$TarExe,
-        [string]$LogRoot,
-        [switch]$SkipBackup
-    )
-
-    $releaseTarball = Get-ReleaseArchive -RootPath $ExpandedDistributionRoot
-    if (-not $releaseTarball) {
-        throw "Could not find the LEON release archive under '$ExpandedDistributionRoot'."
-    }
-    $backupRoot = $null
-    if (-not $SkipBackup) {
-        $backupRoot = Backup-WindRiverInstall -RootPath $WindRiverPath -LogRoot $LogRoot
-        Write-Host "Backup saved to $backupRoot"
-    }
-    else {
-        Write-Warning 'Skipping backup by request.'
-    }
-    Write-Host "Extracting LEON overlay into $WindRiverPath"
-
-    & $TarExe -xf $releaseTarball.FullName -C $WindRiverPath
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to install LEON distribution from '$($releaseTarball.FullName)'."
-    }
-
-    return $backupRoot
-}
-
-function Launch-CompileGui {
-    param([string]$ExpandedDistributionRoot)
-
-    $compileGui = Get-ChildItem -Path $ExpandedDistributionRoot -Recurse -File -Filter 'compile-6.9*.exe' | Select-Object -First 1
-    if (-not $compileGui) {
-        Write-Warning 'The compile GUI was not found in the expanded distribution.'
-        return
-    }
-
-    Start-Process -FilePath $compileGui.FullName
-    Write-Host "Opened compile GUI: $($compileGui.FullName)"
-}
-
-if (-not $ValidateOnly -and -not $SkipElevation -and -not (Test-Administrator)) {
-    Restart-Elevated
-}
-
-$tarExe = Assert-Command -Name 'tar.exe'
-$null = Assert-Command -Name 'robocopy.exe'
-
-$downloadRoot = Join-Path $WorkRoot 'downloads'
-$toolsRoot = Join-Path $WorkRoot 'tools'
-$expandedRoot = Join-Path $WorkRoot 'expanded'
-$logRoot = Join-Path $WorkRoot 'logs'
-
-foreach ($path in @($WorkRoot, $downloadRoot, $toolsRoot, $expandedRoot, $logRoot)) {
-    Ensure-Directory -Path $path
-}
-
-$transcriptPath = Join-Path $logRoot ("install-{0}.log" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))
-$transcriptStarted = $false
-
-try {
-    Start-Transcript -Path $transcriptPath -Force | Out-Null
-    $transcriptStarted = $true
-
-    Write-Host "$($script:Config.ProductName) installer" -ForegroundColor Green
-    Write-Host "Release: $($script:Config.ReleaseVersion)"
-    Write-Host "Wind River root: $WindRiverRoot"
-    Write-Host ''
-    Write-Warning "Frontgrade Gaisler release $($script:Config.ReleaseVersion) requires Wind River VxWorks $($script:Config.RequiredVxWorks) and $($script:Config.RequiredWorkbench)."
-    Write-Warning 'If your base Wind River install is 6.9.4.7, the current Gaisler release is outside the supported matrix.'
-
-    Write-Step 'Validating Wind River installation layout'
-    Assert-WindRiverLayout -RootPath $WindRiverRoot
-
-    if (Test-Path -LiteralPath $SourceFilesRoot) {
-        Write-Host "Using local source folder: $SourceFilesRoot"
-
-        $partialDownloads = Get-ChildItem -LiteralPath $SourceFilesRoot -Filter '*.crdownload' -File -ErrorAction SilentlyContinue
-        foreach ($partialDownload in $partialDownloads) {
-            Write-Warning "Found incomplete download: $($partialDownload.Name)"
+        if ($confirm -eq [System.Windows.Forms.DialogResult]::Yes) {
+            Invoke-InstallPack
         }
     }
-    else {
-        Write-Host "Local source folder not found: $SourceFilesRoot"
+    catch {
+        Log "ERROR: $($_.Exception.Message)"
+        [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "Install Error")
     }
+})
 
-    if (-not $ExpandedDistributionRoot) {
-        $ExpandedDistributionRoot = Find-ExpandedDistributionPath -SearchRoots @($SourceFilesRoot, $expandedRoot)
-        if ($ExpandedDistributionRoot) {
-            Write-Host "Found pre-expanded distribution: $ExpandedDistributionRoot"
-        }
-    }
+Log "Ready."
+Log "Put this script anywhere. Everything builds relative to: $ScriptDir"
 
-    $distributionZipPath = $null
-    if (-not $ExpandedDistributionRoot) {
-        $distributionZipPath = Find-ArtifactPath `
-            -FileName $script:Config.DistributionZipName `
-            -SearchRoots @($SourceFilesRoot, $downloadRoot)
-    }
-
-    $toolchainInstallerPath = $null
-    $toolchainZipPath = $null
-    if (-not $SkipToolchainInstall) {
-        $toolchainInstallerPath = Find-ArtifactPath `
-            -FileName $script:Config.ToolchainInstallerName `
-            -SearchRoots @($SourceFilesRoot, $downloadRoot)
-        $toolchainZipPath = Find-ArtifactPath `
-            -FileName $script:Config.ToolchainZipName `
-            -SearchRoots @($SourceFilesRoot, $downloadRoot)
-    }
-
-    $guidePdfPath = Find-ArtifactPath `
-        -FileName $script:Config.GuidePdfName `
-        -SearchRoots @($SourceFilesRoot, $downloadRoot)
-
-    $needsDownloadCredential = $false
-    if (-not $ExpandedDistributionRoot -and -not $distributionZipPath) {
-        $needsDownloadCredential = $true
-    }
-    if (-not $SkipToolchainInstall -and -not $toolchainInstallerPath -and -not $toolchainZipPath) {
-        $needsDownloadCredential = $true
-    }
-
-    $downloadCredential = $null
-    if ($needsDownloadCredential) {
-        Write-Step 'Downloading missing official Gaisler artifacts'
-        $downloadCredential = Resolve-DownloadCredential -UserName $DownloadUser -Password $DownloadPassword
-    }
-    else {
-        Write-Step 'Using locally provided Gaisler artifacts'
-    }
-
-    if (-not $ExpandedDistributionRoot -and -not $distributionZipPath) {
-        $distributionZipPath = Join-Path $downloadRoot $script:Config.DistributionZipName
-        Invoke-Download `
-            -Uri "$($script:Config.DownloadBaseUrl)/$($script:Config.DistributionZipName)" `
-            -Credential $downloadCredential `
-            -DestinationPath $distributionZipPath
-    }
-
-    if (-not $SkipToolchainInstall -and -not $toolchainInstallerPath -and -not $toolchainZipPath) {
-        $toolchainInstallerPath = Join-Path $downloadRoot $script:Config.ToolchainInstallerName
-        Invoke-Download `
-            -Uri "$($script:Config.DownloadBaseUrl)/$($script:Config.ToolchainInstallerName)" `
-            -Credential $downloadCredential `
-            -DestinationPath $toolchainInstallerPath
-    }
-
-    if (-not $guidePdfPath) {
-        if ($downloadCredential) {
-            $guidePdfPath = Join-Path $downloadRoot $script:Config.GuidePdfName
-            Invoke-Download `
-                -Uri "$($script:Config.DownloadBaseUrl)/$($script:Config.GuidePdfName)" `
-                -Credential $downloadCredential `
-                -DestinationPath $guidePdfPath
-        }
-        else {
-            Write-Warning "Optional guide PDF not found in '$SourceFilesRoot'."
-        }
-    }
-
-    if ($ValidateOnly) {
-        Write-Step 'Validation complete'
-        Write-Host "Distribution ZIP : $distributionZipPath"
-        Write-Host "Toolchain EXE    : $toolchainInstallerPath"
-        Write-Host "Toolchain ZIP    : $toolchainZipPath"
-        Write-Host "Guide PDF        : $guidePdfPath"
-        if (-not $ExpandedDistributionRoot) {
-            Write-Host 'Next requirement : the separate Gaisler ZIP password is still needed to extract the distribution archive.'
-        }
-        return
-    }
-
-    $sevenZipExe = $null
-    if ($toolchainZipPath -or -not $ExpandedDistributionRoot) {
-        Write-Step 'Preparing archive tools'
-        $sevenZipExe = Install-LocalSevenZip -ToolsRoot $toolsRoot
-    }
-
-    $distExpandedRoot = $null
-    if ($ExpandedDistributionRoot) {
-        Write-Step 'Using a pre-expanded LEON distribution'
-        $distExpandedRoot = Get-DistributionRootFromPath -Path $ExpandedDistributionRoot
-        Write-Host "Distribution root: $distExpandedRoot"
-    }
-    else {
-
-        Write-Step 'Prompting for the Gaisler distribution ZIP password'
-        $distributionPassword = Get-SecretValue `
-            -Value $DistributionPassword `
-            -PromptText 'Enter the separate ZIP password for dist-vxworks-6.9-2.3.0.tar.gz.zip'
-
-        Write-Step 'Expanding the protected LEON distribution'
-        $zipExpandedRoot = Join-Path $expandedRoot 'zip'
-        $distExpandedRoot = Join-Path $expandedRoot 'dist'
-        Expand-EncryptedZip `
-            -SevenZipExe $sevenZipExe `
-            -ArchivePath $distributionZipPath `
-            -Password $distributionPassword `
-            -DestinationPath $zipExpandedRoot
-
-        $distributionTarball = Get-SingleFile -RootPath $zipExpandedRoot -Filter 'dist-vxworks-6.9-*.tar.gz'
-        Expand-TarArchive `
-            -TarExe $tarExe `
-            -ArchivePath $distributionTarball `
-            -DestinationPath $distExpandedRoot
-        $distExpandedRoot = Get-DistributionRootFromPath -Path $distExpandedRoot
-        Write-Host "Distribution root: $distExpandedRoot"
-    }
-
-    if (-not $SkipToolchainInstall) {
-        Write-Step 'Installing the LEON GCC toolchain'
-        $toolchainLog = Join-Path $logRoot 'gcc-toolchain-install.log'
-        Install-GccToolchain `
-            -InstallerPath $toolchainInstallerPath `
-            -ZipPath $toolchainZipPath `
-            -LogPath $toolchainLog `
-            -SevenZipExe $sevenZipExe `
-            -ScratchRoot $expandedRoot
-    }
-    else {
-        Write-Step 'Skipping GCC toolchain install by request'
-    }
-
-        Write-Step 'Installing the LEON VxWorks sources using the documented manual overlay flow'
-        $backupRoot = Install-LeonSourcesManual `
-            -WindRiverPath $WindRiverRoot `
-            -ExpandedDistributionRoot $distExpandedRoot `
-            -TarExe $tarExe `
-            -LogRoot $logRoot `
-            -SkipBackup:$SkipBackup
-
-    if (-not $SkipCompileGui) {
-        Write-Step 'Launching the vendor compile GUI'
-        Launch-CompileGui -ExpandedDistributionRoot $distExpandedRoot
-    }
-    else {
-        Write-Step 'Skipping compile GUI launch by request'
-    }
-
-    Write-Step 'Install complete'
-    Write-Host "Backup folder : $backupRoot"
-    Write-Host "Transcript    : $transcriptPath"
-    Write-Host "Guide PDF     : $guidePdfPath"
-    Write-Host ''
-    Write-Host 'Remember to update Workbench build rules in each workspace:'
-    Write-Host 'Window -> Preferences -> Wind River -> Build -> Build Properties -> Restore Defaults for each VxWorks rule'
-}
-catch {
-    Write-Error $_
-    throw
-}
-finally {
-    if ($transcriptStarted) {
-        Stop-Transcript | Out-Null
-    }
-
-    if (-not $NoPause) {
-        Write-Host ''
-        Read-Host 'Press Enter to close'
-    }
-}
+[void]$form.ShowDialog()
